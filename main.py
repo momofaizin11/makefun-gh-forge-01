@@ -997,6 +997,132 @@ def tag_target(data: bytes) -> str:
     return ""
 
 
+def commit_identities(data: bytes):
+    """(raw author line, raw committer line) of a commit object."""
+    author = committer = b""
+    for line in data.split(b"\n"):
+        if line.startswith(b"author "):
+            author = line[7:]
+        elif line.startswith(b"committer "):
+            committer = line[10:]
+        elif line == b"":
+            break
+    return author, committer
+
+
+def commit_message(data: bytes) -> str:
+    idx = data.find(b"\n\n")
+    if idx < 0:
+        return ""
+    return data[idx + 2:].decode("utf-8", "replace").rstrip("\n")
+
+
+def ident_json(raw: bytes, fallback: str) -> dict:
+    """Turn "Name <mail> seconds +hhmm" into the REST author shape."""
+    text = raw.decode("utf-8", "replace").strip()
+    name = text
+    email = ""
+    tail = []
+    if " <" in text:
+        name, rest = text.split(" <", 1)
+        email = rest.split(">", 1)[0]
+        tail = rest.split(">", 1)[1].strip().split(" ")
+    when = 0
+    zone = 0
+    if tail and tail[0].lstrip("-").isdigit():
+        when = int(tail[0])
+        if len(tail) > 1 and len(tail[1]) == 5 and tail[1][0] in "+-":
+            try:
+                zone = int(tail[1][1:3]) * 3600 + int(tail[1][3:5]) * 60
+                if tail[1][0] == "-":
+                    zone = -zone
+            except ValueError:
+                zone = 0
+    name = name.strip() or fallback
+    date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when + zone)) if when else now_iso()
+    return {"name": name, "email": email or "%s@users.noreply.github.com" % name,
+            "date": date}
+
+
+def git_tree_files(repo: dict, tree_oid: str) -> dict:
+    """Flat path -> blob oid map of one git tree, registering its blobs."""
+    gs = repo["_git"]
+    out = {}
+    stack = [(tree_oid, "")]
+    guard = 0
+    while stack:
+        oid, prefix = stack.pop()
+        guard += 1
+        if guard > 200000:
+            break
+        obj = gs.objects.get(oid)
+        if obj is None or obj[0] != "tree":
+            continue
+        for mode, name, child in tree_entries(obj[1]):
+            path = prefix + name
+            if mode in ("40000", "040000"):
+                stack.append((child, path + "/"))
+                continue
+            if mode == "160000":
+                continue
+            child_obj = gs.objects.get(child)
+            if child_obj is not None and child_obj[0] == "blob":
+                repo["blobs"][child] = child_obj[1]
+            out[path] = child
+    return out
+
+
+def import_git_ref(repo: dict, ref: str, sha: str) -> None:
+    """Copy an accepted receive-pack ref update into the REST-facing record.
+
+    A push lands in the git store only, while the REST layer (branches,
+    contents, commits, pull requests) reads repo["refs"], repo["commits"],
+    repo["trees"] and repo["blobs"].  Transcribe the pushed tip and its
+    ancestors into those maps so the branch is visible over REST too.
+    """
+    if not ref.startswith("refs/heads/"):
+        return
+    branch = ref[len("refs/heads/"):]
+    gs = repo["_git"]
+    queue = [sha]
+    seen = set()
+    while queue:
+        oid = queue.pop(0)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        obj = gs.objects.get(oid)
+        if obj is None:
+            continue
+        otype, data = obj
+        if otype == "tag":
+            target = tag_target(data)
+            if target:
+                queue.append(target)
+            continue
+        if otype != "commit":
+            continue
+        tree, parents = commit_meta(data)
+        if oid not in repo["commits"]:
+            if tree and tree not in repo["trees"]:
+                repo["trees"][tree] = git_tree_files(repo, tree)
+            author, committer = commit_identities(data)
+            repo["commits"][oid] = {
+                "sha": oid, "tree": tree, "parents": list(parents),
+                "message": commit_message(data),
+                "author": ident_json(author, VIEWER),
+                "committer": ident_json(committer, VIEWER),
+                "_body": data,
+            }
+            repo["_body_%s" % oid] = data
+        queue.extend(parents)
+    commit = repo["commits"].get(sha)
+    if commit is None:
+        return
+    STORE.set_branch(repo, branch, sha, dict(repo["trees"].get(commit["tree"], {})))
+    STORE.touch(repo)
+
+
 class GitStore:
     """One repository's git objects and refs (content addressed, in memory)."""
 
@@ -1629,6 +1755,11 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if new == GIT_ZERO:
                     gs.refs.pop(ref, None)
+                    if ref.startswith("refs/heads/"):
+                        branch = ref[len("refs/heads/"):]
+                        repo["refs"].pop(branch, None)
+                        repo["branch_files"].pop(branch, None)
+                        STORE.touch(repo)
                     continue
                 if new not in gs.objects:
                     problems[ref] = "missing necessary objects"
@@ -1637,6 +1768,10 @@ class Handler(BaseHTTPRequestHandler):
                     problems[ref] = "non-fast-forward"
                     continue
                 gs.refs[ref] = new
+                # The update lives in the git store; mirror it into the record
+                # the REST layer reads, so a pushed branch shows up in
+                # /branches, /contents and pull-request creation.
+                import_git_ref(repo, ref, new)
         lines = ["unpack %s" % unpack]
         for _old, _new, ref in commands:
             if ref in problems:
