@@ -1304,6 +1304,1084 @@ def sideband_pack(pack: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------
+# GraphQL v4: document parser, schema table and executor
+# --------------------------------------------------------------------------
+
+_GQL_MISSING = object()
+
+
+class GqlFail(Exception):
+    """A GraphQL-level failure: answered as a 200 whose body carries `errors`."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def gql_global_id(kind: str, number: int) -> str:
+    """An opaque, stable Relay-style global id (never the plain database id)."""
+    return b64encode(("04:%s%d" % (kind, number)).encode("ascii"))
+
+
+def gql_decode_id(text):
+    """(kind, number) of a global id, or (None, None) when it is not one of ours."""
+    if not isinstance(text, str) or text == "":
+        return None, None
+    try:
+        raw = b64decode(text).decode("ascii")
+    except Exception:
+        return None, None
+    if not raw.startswith("04:"):
+        return None, None
+    rest = raw[3:]
+    idx = 0
+    while idx < len(rest) and not rest[idx].isdigit():
+        idx += 1
+    kind = rest[:idx]
+    digits = rest[idx:]
+    if kind == "" or not digits.isdigit():
+        return None, None
+    return kind, int(digits)
+
+
+def gql_cursor(offset: int) -> str:
+    return b64encode(("cursor:%d" % offset).encode("ascii"))
+
+
+def gql_cursor_offset(cursor) -> int:
+    if not isinstance(cursor, str) or cursor == "":
+        return 0
+    try:
+        raw = b64decode(cursor).decode("ascii")
+    except Exception:
+        return 0
+    if not raw.startswith("cursor:"):
+        return 0
+    try:
+        return max(0, int(raw[len("cursor:"):]))
+    except ValueError:
+        return 0
+
+
+def gql_tokenize(text: str) -> list:
+    tokens = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,\ufeff":
+            i += 1
+            continue
+        if ch == "#":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        if text.startswith("...", i):
+            tokens.append(("spread", "..."))
+            i += 3
+            continue
+        if ch == '"':
+            if text.startswith('"""', i):
+                end = text.find('"""', i + 3)
+                if end < 0:
+                    end = n
+                tokens.append(("string", text[i + 3:end]))
+                i = end + 3
+                continue
+            j = i + 1
+            buf = []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    nxt = text[j + 1]
+                    if nxt == "u" and j + 5 < n:
+                        try:
+                            buf.append(chr(int(text[j + 2:j + 6], 16)))
+                        except ValueError:
+                            pass
+                        j += 6
+                        continue
+                    buf.append({"n": "\n", "t": "\t", "r": "\r", '"': '"',
+                                "\\": "\\", "/": "/"}.get(nxt, nxt))
+                    j += 2
+                    continue
+                buf.append(text[j])
+                j += 1
+            tokens.append(("string", "".join(buf)))
+            i = j + 1
+            continue
+        if ch in "{}()[]:!=@|$&":
+            tokens.append(("punct", ch))
+            i += 1
+            continue
+        if ch == "-" or ch.isdigit():
+            j = i + 1
+            while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
+                j += 1
+            tokens.append(("number", text[i:j]))
+            i = j
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tokens.append(("name", text[i:j]))
+            i = j
+            continue
+        i += 1
+    return tokens
+
+
+class GqlParser:
+    """Recursive descent over the document shapes gh and github-mcp-server send."""
+
+    __slots__ = ("tokens", "pos")
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self, offset=0):
+        idx = self.pos + offset
+        return self.tokens[idx] if 0 <= idx < len(self.tokens) else (None, None)
+
+    def take(self):
+        tok = self.peek()
+        self.pos += 1
+        return tok
+
+    def at(self, kind, value=None):
+        k, v = self.peek()
+        return k == kind and (value is None or v == value)
+
+    def expect(self, kind, value=None):
+        k, v = self.take()
+        if k != kind or (value is not None and v != value):
+            raise ValueError("expected %s, saw %s %s" % (value or kind, k, v))
+        return v
+
+    def parse_document(self):
+        ops = []
+        while self.peek()[0] is not None:
+            ops.append(self.parse_operation())
+        return ops
+
+    def parse_operation(self):
+        if self.at("punct", "{"):
+            return {"type": "query", "name": None, "variables": {},
+                    "selection": self.parse_selection_set()}
+        k, v = self.take()
+        if k != "name" or v not in ("query", "mutation", "subscription"):
+            raise ValueError("expected an operation, saw %s" % (v,))
+        name = None
+        if self.peek()[0] == "name":
+            name = self.take()[1]
+        if self.at("punct", "("):
+            self.parse_variable_definitions()
+        self.skip_directives()
+        return {"type": v, "name": name, "variables": {},
+                "selection": self.parse_selection_set()}
+
+    def parse_variable_definitions(self):
+        self.expect("punct", "(")
+        while not self.at("punct", ")"):
+            if self.peek()[0] is None:
+                raise ValueError("unterminated variable definitions")
+            self.expect("punct", "$")
+            self.expect("name")
+            self.expect("punct", ":")
+            self.parse_type_ref()
+            if self.at("punct", "="):
+                self.take()
+                self.parse_value()
+            self.skip_directives()
+        self.expect("punct", ")")
+
+    def parse_type_ref(self):
+        if self.at("punct", "["):
+            self.take()
+            self.parse_type_ref()
+            self.expect("punct", "]")
+        else:
+            self.expect("name")
+        if self.at("punct", "!"):
+            self.take()
+
+    def skip_directives(self):
+        while self.at("punct", "@"):
+            self.take()
+            self.expect("name")
+            if self.at("punct", "("):
+                self.parse_arguments()
+
+    def parse_selection_set(self):
+        self.expect("punct", "{")
+        out = []
+        while not self.at("punct", "}"):
+            if self.peek()[0] is None:
+                raise ValueError("unterminated selection set")
+            out.append(self.parse_selection())
+        self.expect("punct", "}")
+        return out
+
+    def parse_selection(self):
+        if self.at("spread"):
+            self.take()
+            condition = None
+            if self.at("name", "on"):
+                self.take()
+                condition = self.expect("name")
+            self.skip_directives()
+            return {"kind": "fragment", "condition": condition,
+                    "selection": self.parse_selection_set()}
+        if self.peek()[0] == "name" and self.peek(1) == ("punct", ":"):
+            alias = self.take()[1]
+            self.take()
+            name = self.expect("name")
+        else:
+            alias = None
+            name = self.expect("name")
+        args = self.parse_arguments() if self.at("punct", "(") else {}
+        self.skip_directives()
+        selection = self.parse_selection_set() if self.at("punct", "{") else None
+        return {"kind": "field", "alias": alias or name, "name": name, "args": args,
+                "selection": selection}
+
+    def parse_arguments(self):
+        self.expect("punct", "(")
+        out = {}
+        while not self.at("punct", ")"):
+            if self.peek()[0] is None:
+                raise ValueError("unterminated arguments")
+            name = self.expect("name")
+            self.expect("punct", ":")
+            out[name] = self.parse_value()
+        self.expect("punct", ")")
+        return out
+
+    def parse_value(self):
+        k, v = self.peek()
+        if k == "punct" and v == "$":
+            self.take()
+            return ("var", self.expect("name"))
+        if k == "punct" and v == "[":
+            self.take()
+            items = []
+            while not self.at("punct", "]"):
+                if self.peek()[0] is None:
+                    raise ValueError("unterminated list value")
+                items.append(self.parse_value())
+            self.expect("punct", "]")
+            return ("list", items)
+        if k == "punct" and v == "{":
+            self.take()
+            out = {}
+            while not self.at("punct", "}"):
+                if self.peek()[0] is None:
+                    raise ValueError("unterminated object value")
+                name = self.expect("name")
+                self.expect("punct", ":")
+                out[name] = self.parse_value()
+            self.expect("punct", "}")
+            return ("obj", out)
+        self.take()
+        if k == "string":
+            return ("str", v)
+        if k == "number":
+            if any(c in v for c in ".eE"):
+                try:
+                    return ("float", float(v))
+                except ValueError:
+                    return ("int", 0)
+            try:
+                return ("int", int(v))
+            except ValueError:
+                return ("int", 0)
+        if k == "name":
+            if v == "true":
+                return ("bool", True)
+            if v == "false":
+                return ("bool", False)
+            if v == "null":
+                return ("null", None)
+            return ("enum", v)
+        raise ValueError("unexpected value %s" % (v,))
+
+
+def gql_value(value, variables):
+    """Evaluate one parsed argument value against the request's variables."""
+    kind, raw = value
+    if kind == "var":
+        return variables.get(raw)
+    if kind == "list":
+        return [gql_value(item, variables) for item in raw]
+    if kind == "obj":
+        return dict((name, gql_value(item, variables)) for name, item in raw.items())
+    return raw
+
+
+# The schema surface, as name tables: one tuple of field names per object type.
+GQL_OBJECT_FIELDS = {
+    "Query": ("viewer", "repository", "node", "nodes", "__type", "__schema", "user",
+              "repositoryOwner", "search", "rateLimit"),
+    "Mutation": ("createIssue", "closeIssue", "reopenIssue", "createPullRequest",
+                 "mergePullRequest", "addComment", "updateIssue", "deleteIssue",
+                 "updatePullRequest"),
+    "Repository": ("id", "databaseId", "name", "nameWithOwner", "owner", "description",
+                   "isPrivate", "isFork", "isArchived", "isEmpty", "viewerPermission",
+                   "viewerCanAdminister", "hasIssuesEnabled", "hasWikiEnabled",
+                   "hasProjectsEnabled", "hasDiscussionsEnabled", "defaultBranchRef",
+                   "issue", "issues", "pullRequest", "pullRequests", "ref", "refs",
+                   "object", "labels", "url", "sshUrl", "createdAt", "updatedAt",
+                   "pushedAt", "stargazerCount", "forkCount", "watcherCount",
+                   "diskUsage", "primaryLanguage", "licenseInfo", "repositoryTopics"),
+    "Ref": ("id", "name", "prefix", "target"),
+    "Commit": ("id", "oid", "abbreviatedOid", "message", "messageHeadline",
+               "committedDate", "author", "committer", "url", "tree", "parents"),
+    "Tree": ("id", "oid", "abbreviatedOid", "entries"),
+    "User": ("id", "login", "name", "email", "url", "avatarUrl", "bio", "company",
+             "createdAt", "isViewer", "databaseId", "repositories", "resourcePath"),
+    "Issue": ("id", "number", "title", "state", "stateReason", "body", "bodyText",
+              "bodyHTML", "createdAt", "updatedAt", "closedAt", "author", "editor",
+              "url", "resourcePath", "comments", "labels", "assignees", "milestone",
+              "repository", "isPinned", "locked", "includesCreatedEdit",
+              "isReadByViewer"),
+    "PullRequest": ("id", "number", "title", "state", "merged", "mergedAt", "mergeable",
+                    "mergeStateStatus", "headRefName", "baseRefName", "headRefOid",
+                    "baseRefOid", "isDraft", "isCrossRepository", "createdAt",
+                    "updatedAt", "closedAt", "body", "bodyText", "author", "url",
+                    "resourcePath", "files", "commits", "additions", "deletions",
+                    "changedFiles", "repository", "headRepository", "comments",
+                    "reviewDecision", "viewerCanUpdate", "viewerCannotUpdateReasons",
+                    "mergedBy", "mergeCommit", "labels", "reviews"),
+    "Label": ("id", "name", "color", "description"),
+    "IssueComment": ("id", "body", "bodyText", "author", "createdAt", "updatedAt",
+                     "url", "isMinimized", "viewerDidAuthor"),
+    "IssueCommentEdge": ("cursor", "node"),
+    "PullRequestChangedFile": ("path", "additions", "deletions", "changeType",
+                               "viewerViewedState", "blobUrl"),
+    "PullRequestChangedFileEdge": ("cursor", "node"),
+    "PageInfo": ("hasNextPage", "hasPreviousPage", "startCursor", "endCursor"),
+    "IssueConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "IssueEdge": ("cursor", "node"),
+    "PullRequestConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "PullRequestEdge": ("cursor", "node"),
+    "PullRequestChangedFileConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "IssueCommentConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "PullRequestCommitConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "RepositoryConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "LabelConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "UserConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "RefConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "CommitConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "SearchResultItemConnection": ("nodes", "edges", "totalCount", "pageInfo",
+                                   "issueCount", "repositoryCount", "userCount"),
+    "RepositoryTopicConnection": ("nodes", "edges", "totalCount", "pageInfo"),
+    "IssueLabel": ("id", "name", "color", "description"),
+    "RateLimit": ("limit", "remaining", "used", "resetAt", "cost", "nodeCount"),
+    "CreateIssuePayload": ("clientMutationId", "issue"),
+    "CloseIssuePayload": ("clientMutationId", "issue"),
+    "ReopenIssuePayload": ("clientMutationId", "issue"),
+    "CreatePullRequestPayload": ("clientMutationId", "pullRequest"),
+    "MergePullRequestPayload": ("clientMutationId", "pullRequest"),
+    "AddCommentPayload": ("clientMutationId", "commentEdge", "subject", "timelineEdge"),
+    "__Schema": ("queryType", "mutationType", "subscriptionType", "types", "directives"),
+    "__Type": ("kind", "name", "description", "fields", "enumValues", "inputFields",
+               "interfaces", "possibleTypes", "ofType"),
+    "__Field": ("name", "description", "args", "type", "isDeprecated",
+                "deprecationReason"),
+    "__InputValue": ("name", "description", "type", "defaultValue"),
+    "__EnumValue": ("name", "description", "isDeprecated", "deprecationReason"),
+}
+
+GQL_ENUMS = {
+    "IssueState": ("OPEN", "CLOSED"),
+    "IssueStateReason": ("COMPLETED", "NOT_PLANNED", "REOPENED"),
+    "IssueOrderField": ("CREATED_AT", "UPDATED_AT", "COMMENTS"),
+    "OrderDirection": ("ASC", "DESC"),
+    "MergeableState": ("MERGEABLE", "CONFLICTING", "UNKNOWN"),
+    "PullRequestState": ("OPEN", "CLOSED", "MERGED"),
+    "PullRequestMergeMethod": ("MERGE", "SQUASH", "REBASE"),
+    "PullRequestReviewDecision": ("APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"),
+    "RepositoryPermission": ("ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ"),
+    "SearchType": ("ISSUE", "REPOSITORY", "USER", "DISCUSSION", "ISSUE_ADVANCED"),
+}
+
+GQL_INPUT_OBJECTS = {
+    "CreateIssueInput": ("repositoryId", "title", "body", "labelIds", "milestoneId",
+                         "assigneeIds", "clientMutationId"),
+    "CloseIssueInput": ("issueId", "stateReason", "clientMutationId"),
+    "ReopenIssueInput": ("issueId", "clientMutationId"),
+    "CreatePullRequestInput": ("repositoryId", "baseRefName", "headRefName", "title",
+                              "body", "draft", "clientMutationId"),
+    "MergePullRequestInput": ("pullRequestId", "mergeMethod", "commitHeadline",
+                              "commitBody", "expectedHeadOid", "clientMutationId"),
+    "AddCommentInput": ("subjectId", "body", "clientMutationId"),
+}
+
+GQL_SCALARS = ("String", "Int", "Float", "Boolean", "ID", "DateTime", "URI", "HTML",
+               "GitObjectID", "Base64String", "GitTimestamp")
+
+
+def gql_scalar_type(name: str = "String") -> dict:
+    return {"__t": "__Type", "kind": "SCALAR", "name": name, "description": None,
+            "fields": None, "enumValues": None, "inputFields": None,
+            "interfaces": [], "possibleTypes": None, "ofType": None}
+
+
+def gql_field_object(name: str) -> dict:
+    return {"__t": "__Field", "name": name, "description": "%s field" % name, "args": [],
+            "type": gql_scalar_type(), "isDeprecated": False, "deprecationReason": None}
+
+
+def gql_type_object(name):
+    """`__type(name:)`: an object, enum, input object or scalar description."""
+    if not isinstance(name, str) or name == "":
+        return None
+    if name in GQL_OBJECT_FIELDS:
+        return {"__t": "__Type", "kind": "OBJECT", "name": name,
+                "description": "%s type" % name,
+                "fields": [gql_field_object(f) for f in GQL_OBJECT_FIELDS[name]],
+                "enumValues": None, "inputFields": None, "interfaces": [],
+                "possibleTypes": None, "ofType": None}
+    if name in GQL_ENUMS:
+        return {"__t": "__Type", "kind": "ENUM", "name": name,
+                "description": "%s enum" % name, "fields": None,
+                "enumValues": [{"__t": "__EnumValue", "name": v, "description": None,
+                                "isDeprecated": False, "deprecationReason": None}
+                               for v in GQL_ENUMS[name]],
+                "inputFields": None, "interfaces": [], "possibleTypes": None,
+                "ofType": None}
+    if name in GQL_INPUT_OBJECTS:
+        return {"__t": "__Type", "kind": "INPUT_OBJECT", "name": name,
+                "description": "%s input" % name, "fields": None, "enumValues": None,
+                "inputFields": [{"__t": "__InputValue", "name": f, "description": None,
+                                 "type": gql_scalar_type(), "defaultValue": None}
+                                for f in GQL_INPUT_OBJECTS[name]],
+                "interfaces": [], "possibleTypes": None, "ofType": None}
+    if name in GQL_SCALARS:
+        return gql_scalar_type(name)
+    return None
+
+
+def gql_schema() -> dict:
+    names = (list(GQL_OBJECT_FIELDS) + list(GQL_ENUMS) + list(GQL_INPUT_OBJECTS)
+             + list(GQL_SCALARS))
+    return {"__t": "__Schema", "queryType": gql_type_object("Query"),
+            "mutationType": gql_type_object("Mutation"), "subscriptionType": None,
+            "types": [gql_type_object(n) for n in names], "directives": []}
+
+
+# -- object builders -------------------------------------------------------
+
+def gql_page_info(has_next: bool, has_prev: bool = False,
+                  start: str = None, end: str = None) -> dict:
+    return {"__t": "PageInfo", "hasNextPage": bool(has_next),
+            "hasPreviousPage": bool(has_prev), "startCursor": start, "endCursor": end}
+
+
+def gql_user(login) -> dict:
+    if not isinstance(login, str) or login == "":
+        login = VIEWER
+    user = STORE.user(login)
+    return {"__t": "User", "id": gql_global_id("User", user["id"]),
+            "databaseId": user["id"], "login": user["login"], "name": user["login"],
+            "email": "", "url": user["html_url"], "avatarUrl": user["avatar_url"],
+            "bio": "", "company": "", "createdAt": None, "isViewer": login == VIEWER,
+            "resourcePath": "/%s" % login}
+
+
+def gql_commit(repo: dict, sha: str):
+    commit = repo["commits"].get(sha)
+    if commit is None:
+        return None
+    message = commit["message"]
+    return {"__t": "Commit", "oid": sha, "abbreviatedOid": sha[:7],
+            "id": "C_%s" % sha,
+            "message": message, "messageHeadline": message.split("\n")[0],
+            "committedDate": commit["committer"]["date"],
+            "author": {"__t": "GitActor", "name": commit["author"]["name"],
+                       "email": commit["author"]["email"],
+                       "date": commit["author"]["date"], "user": gql_user(VIEWER)},
+            "committer": {"__t": "GitActor", "name": commit["committer"]["name"],
+                          "email": commit["committer"]["email"],
+                          "date": commit["committer"]["date"], "user": gql_user(VIEWER)},
+            "url": "https://github.com/%s/commit/%s" % (repo["full_name"], sha),
+            "tree": {"__t": "Tree", "oid": commit["tree"],
+                     "abbreviatedOid": commit["tree"][:7],
+                     "id": "T_%s" % commit["tree"], "entries": []},
+            "parents": {"__t": "CommitConnection",
+                        "nodes": [gql_commit(repo, p) for p in commit["parents"]
+                                  if p in repo["commits"]],
+                        "edges": [], "totalCount": len(commit["parents"]),
+                        "pageInfo": gql_page_info(False)}}
+
+
+def gql_label(label: dict) -> dict:
+    return {"__t": "Label", "id": gql_global_id("Label", label["id"]),
+            "name": label["name"], "color": label.get("color", "ededed"),
+            "description": label.get("description")}
+
+
+def gql_repository(repo: dict) -> dict:
+    default = repo["default_branch"]
+    ref = repo["refs"].get(default)
+    sha = ref["sha"] if isinstance(ref, dict) else None
+    branch_ref = None
+    if sha is not None:
+        branch_ref = {"__t": "Ref", "id": gql_global_id("Ref", repo["id"] * 100 + 1),
+                      "name": default, "prefix": "refs/heads/",
+                      "target": gql_commit(repo, sha)}
+    return {
+        "__t": "Repository", "__ref": repo,
+        "id": gql_global_id("Repository", repo["id"]),
+        "databaseId": repo["id"],
+        "name": repo["name"],
+        "nameWithOwner": repo["full_name"],
+        "owner": gql_user(VIEWER),
+        "description": repo["description"] or None,
+        "isPrivate": repo["private"], "isFork": False, "isArchived": False,
+        "isEmpty": not bool(repo["refs"]),
+        "viewerPermission": "ADMIN", "viewerCanAdminister": True,
+        "hasIssuesEnabled": True, "hasWikiEnabled": True, "hasProjectsEnabled": True,
+        "hasDiscussionsEnabled": False,
+        "defaultBranchRef": branch_ref,
+        "url": "https://github.com/%s" % repo["full_name"],
+        "sshUrl": "git@github.com:%s.git" % repo["full_name"],
+        "createdAt": repo["created_at"], "updatedAt": repo["updated_at"],
+        "pushedAt": repo["pushed_at"], "stargazerCount": 0, "forkCount": 0,
+        "watcherCount": 0, "diskUsage": 0, "primaryLanguage": None, "licenseInfo": None,
+    }
+
+
+def gql_issue(repo: dict, issue: dict) -> dict:
+    number = issue["number"]
+    labels = [gql_label(l) for l in issue["labels"]]
+    comments = [gql_comment(repo, issue, c) for c in issue["comments"]]
+    return {
+        "__t": "Issue", "__ref": (repo, issue),
+        "id": gql_global_id("Issue", issue["id"]),
+        "number": number,
+        "title": issue["title"],
+        "state": "OPEN" if issue["state"] == "open" else "CLOSED",
+        "stateReason": issue.get("state_reason"),
+        "body": issue["body"], "bodyText": issue["body"],
+        "bodyHTML": "<p>%s</p>" % issue["body"],
+        "createdAt": issue["created_at"], "updatedAt": issue["updated_at"],
+        "closedAt": issue["closed_at"], "author": gql_user(VIEWER), "editor": None,
+        "url": "https://github.com/%s/issues/%d" % (repo["full_name"], number),
+        "resourcePath": "/%s/issues/%d" % (repo["full_name"], number),
+        "labels": {"__t": "LabelConnection", "nodes": labels, "edges": [],
+                   "totalCount": len(labels), "pageInfo": gql_page_info(False)},
+        "assignees": {"__t": "UserConnection", "nodes": [], "edges": [],
+                      "totalCount": 0, "pageInfo": gql_page_info(False)},
+        "milestone": None, "isPinned": False, "locked": False,
+        "includesCreatedEdit": False, "isReadByViewer": False,
+        "comments": {"__t": "IssueCommentConnection", "nodes": comments,
+                     "edges": [{"__t": "IssueCommentEdge", "cursor": gql_cursor(i + 1),
+                                "node": c} for i, c in enumerate(comments)],
+                     "totalCount": len(comments), "pageInfo": gql_page_info(False)},
+    }
+
+
+def gql_comment(repo: dict, issue: dict, comment: dict) -> dict:
+    return {"__t": "IssueComment", "id": gql_global_id("IssueComment", comment["id"]),
+            "body": comment["body"], "bodyText": comment["body"],
+            "author": gql_user(VIEWER), "createdAt": comment["created_at"],
+            "updatedAt": comment["updated_at"],
+            "url": "https://github.com/%s/issues/%d#issuecomment-%d" % (
+                repo["full_name"], issue["number"], comment["id"]),
+            "isMinimized": False, "viewerDidAuthor": True}
+
+
+def gql_pull_state(pull: dict) -> str:
+    if pull.get("merged"):
+        return "MERGED"
+    if pull.get("state") == "closed":
+        return "CLOSED"
+    return "OPEN"
+
+
+def gql_pull(repo: dict, pull: dict) -> dict:
+    number = pull["number"]
+    merged = bool(pull.get("merged"))
+    mergeable = "MERGEABLE" if pull.get("mergeable", True) else "CONFLICTING"
+    sha = pull.get("merge_commit_sha")
+    return {
+        "__t": "PullRequest", "__ref": (repo, pull),
+        "id": gql_global_id("PullRequest", pull["id"]),
+        "number": number,
+        "title": pull["title"],
+        "body": pull["body"], "bodyText": pull["body"],
+        "state": gql_pull_state(pull),
+        "merged": merged,
+        "mergedAt": pull.get("merged_at"),
+        "mergeable": mergeable,
+        "mergeStateStatus": "CLEAN" if mergeable == "MERGEABLE" else "DIRTY",
+        "headRefName": pull["head"]["ref"],
+        "baseRefName": pull["base"]["ref"],
+        "headRefOid": pull.get("head_sha"),
+        "baseRefOid": pull.get("base_sha"),
+        "isDraft": False, "isCrossRepository": False,
+        "createdAt": pull["created_at"], "updatedAt": pull["updated_at"],
+        "closedAt": pull.get("closed_at"),
+        "author": gql_user(VIEWER),
+        "url": "https://github.com/%s/pull/%d" % (repo["full_name"], number),
+        "resourcePath": "/%s/pull/%d" % (repo["full_name"], number),
+        "additions": pull.get("additions", 0), "deletions": pull.get("deletions", 0),
+        "changedFiles": pull.get("changed_files", 0),
+        "mergeCommit": gql_commit(repo, sha) if sha else None,
+        "mergedBy": gql_user(VIEWER) if merged else None,
+        "reviewDecision": None, "viewerCanUpdate": True,
+        "viewerCannotUpdateReasons": [],
+        "labels": {"__t": "LabelConnection", "nodes": [], "edges": [],
+                   "totalCount": 0, "pageInfo": gql_page_info(False)},
+        "reviews": {"__t": "PullRequestConnection", "nodes": [], "edges": [],
+                    "totalCount": 0, "pageInfo": gql_page_info(False)},
+    }
+
+
+# -- lookups ---------------------------------------------------------------
+
+def gql_repository_by_name(owner, name):
+    if not isinstance(owner, str) or not isinstance(name, str):
+        return None
+    if owner != VIEWER:
+        return None
+    repo = STORE.repos.get((VIEWER, name))
+    return gql_repository(repo) if repo is not None else None
+
+
+def gql_repo_from_id(text):
+    kind, number = gql_decode_id(text)
+    if kind != "Repository" or number is None:
+        return None
+    for repo in STORE.repos.values():
+        if repo["id"] == number:
+            return repo
+    return None
+
+
+def gql_find_issue(number):
+    if number is None:
+        return None, None
+    for repo in STORE.repos.values():
+        for issue in repo["issues_by_number"].values():
+            if issue["id"] == number:
+                return repo, issue
+    return None, None
+
+
+def gql_find_pull(number):
+    if number is None:
+        return None, None
+    for repo in STORE.repos.values():
+        for pull in repo["pulls"].values():
+            if pull["id"] == number:
+                return repo, pull
+    return None, None
+
+
+def gql_node(text):
+    kind, number = gql_decode_id(text)
+    if kind == "Repository":
+        repo = gql_repo_from_id(text)
+        return gql_repository(repo) if repo is not None else None
+    if kind == "Issue":
+        repo, issue = gql_find_issue(number)
+        return gql_issue(repo, issue) if issue is not None else None
+    if kind == "PullRequest":
+        repo, pull = gql_find_pull(number)
+        return gql_pull(repo, pull) if pull is not None else None
+    if kind == "User":
+        for login in STORE.users:
+            if STORE.users[login]["id"] == number:
+                return gql_user(login)
+        return None
+    return None
+
+
+# -- connections -----------------------------------------------------------
+
+def gql_window(items, args, cursor_of=gql_cursor):
+    """(window, page_info) for one Relay connection: first/after slicing."""
+    offset = gql_cursor_offset(args.get("after"))
+    total = len(items)
+    first = args.get("first")
+    if offset > total:
+        offset = total
+    if isinstance(first, int) and not isinstance(first, bool) and first >= 0:
+        window = items[offset:offset + first]
+        has_next = offset + len(window) < total
+    else:
+        window = items[offset:]
+        has_next = False
+    start = cursor_of(offset) if window else None
+    end = cursor_of(offset + len(window)) if window else None
+    return window, gql_page_info(has_next, offset > 0, start, end)
+
+
+def gql_issues_connection(repo: dict, args: dict) -> dict:
+    issues = list(repo["issues_by_number"].values())
+    states = args.get("states")
+    if isinstance(states, list) and states:
+        wanted = set(str(s).upper() for s in states)
+        issues = [i for i in issues if ("OPEN" if i["state"] == "open" else "CLOSED") in wanted]
+    order = args.get("orderBy")
+    field = "CREATED_AT"
+    direction = "DESC"
+    if isinstance(order, dict):
+        if isinstance(order.get("field"), str):
+            field = order["field"].upper()
+        if isinstance(order.get("direction"), str):
+            direction = order["direction"].upper()
+    issues.sort(key=lambda i: (i.get("_ts") or 0, i["number"]),
+                reverse=(direction != "ASC"))
+    window, page_info = gql_window(issues, args)
+    nodes = [gql_issue(repo, i) for i in window]
+    return {"__t": "IssueConnection", "nodes": nodes,
+            "edges": [{"__t": "IssueEdge", "cursor": gql_cursor(0), "node": n}
+                      for n in nodes],
+            "totalCount": len(issues), "pageInfo": page_info}
+
+
+def gql_pulls_connection(repo: dict, args: dict) -> dict:
+    pulls = list(repo["pulls"].values())
+    states = args.get("states")
+    if isinstance(states, list) and states:
+        wanted = set(str(s).upper() for s in states)
+        pulls = [p for p in pulls if gql_pull_state(p) in wanted]
+    pulls.sort(key=lambda p: (p.get("_ts") or 0, p["number"]), reverse=True)
+    window, page_info = gql_window(pulls, args)
+    nodes = [gql_pull(repo, p) for p in window]
+    return {"__t": "PullRequestConnection", "nodes": nodes,
+            "edges": [{"__t": "PullRequestEdge", "cursor": gql_cursor(0), "node": n}
+                      for n in nodes],
+            "totalCount": len(pulls), "pageInfo": page_info}
+
+
+def gql_files_connection(repo: dict, pull: dict, args: dict) -> dict:
+    files = pull.get("files")
+    nodes = []
+    if isinstance(files, list) and files:
+        for entry in files:
+            nodes.append({"__t": "PullRequestChangedFile", "path": entry["filename"],
+                          "additions": entry.get("additions", 0),
+                          "deletions": entry.get("deletions", 0),
+                          "changeType": {"added": "ADDED", "removed": "DELETED"}
+                          .get(entry.get("status"), "MODIFIED"),
+                          "viewerViewedState": "UNVIEWED", "blobUrl": None})
+    else:
+        base_sha = pull.get("base_sha")
+        head_sha = pull.get("head_sha")
+        if base_sha and head_sha:
+            for path in STORE.changed_paths(repo, base_sha, head_sha):
+                nodes.append({"__t": "PullRequestChangedFile", "path": path,
+                              "additions": 1, "deletions": 0,
+                              "changeType": "MODIFIED", "viewerViewedState": "UNVIEWED",
+                              "blobUrl": None})
+    window, page_info = gql_window(nodes, args)
+    return {"__t": "PullRequestChangedFileConnection", "nodes": window,
+            "edges": [{"__t": "PullRequestChangedFileEdge", "cursor": gql_cursor(0),
+                       "node": n} for n in window],
+            "totalCount": len(nodes), "pageInfo": page_info}
+
+
+# -- mutations -------------------------------------------------------------
+
+def gql_input(args: dict) -> dict:
+    data = args.get("input")
+    return data if isinstance(data, dict) else {}
+
+
+def gql_m_create_issue(args: dict, ctx: dict) -> dict:
+    data = gql_input(args)
+    repo = gql_repo_from_id(data.get("repositoryId"))
+    if repo is None:
+        raise GqlFail("Could not resolve to a Repository with the global id of '%s'."
+                      % data.get("repositoryId"))
+    issue, _ = create_issue(repo, data.get("title"), data.get("body"))
+    return {"__t": "CreateIssuePayload", "clientMutationId": data.get("clientMutationId"),
+            "issue": gql_issue(repo, issue)}
+
+
+def gql_m_close_issue(args: dict, ctx: dict) -> dict:
+    data = gql_input(args)
+    kind, number = gql_decode_id(data.get("issueId"))
+    repo, issue = gql_find_issue(number) if kind == "Issue" else (None, None)
+    if issue is None:
+        raise GqlFail("Could not resolve to an Issue with the global id of '%s'."
+                      % data.get("issueId"))
+    if issue["state"] != "closed":
+        issue["state"] = "closed"
+        issue["closed_at"] = now_iso()
+        issue["updated_at"] = issue["closed_at"]
+        STORE.touch(repo)
+    return {"__t": "CloseIssuePayload", "clientMutationId": data.get("clientMutationId"),
+            "issue": gql_issue(repo, issue)}
+
+
+def gql_m_create_pull(args: dict, ctx: dict) -> dict:
+    data = gql_input(args)
+    repo = gql_repo_from_id(data.get("repositoryId"))
+    if repo is None:
+        raise GqlFail("Could not resolve to a Repository with the global id of '%s'."
+                      % data.get("repositoryId"))
+    head = data.get("headRefName")
+    base = data.get("baseRefName") or repo["default_branch"]
+    if not isinstance(head, str) or head not in repo["refs"]:
+        raise GqlFail("Could not resolve to a branch named '%s'." % (head,))
+    if not isinstance(base, str) or base not in repo["refs"]:
+        raise GqlFail("Could not resolve to a branch named '%s'." % (base,))
+    pull = None
+    for existing in repo["pulls"].values():
+        if (existing["state"] == "open" and existing["head"]["ref"] == head
+                and existing["base"]["ref"] == base):
+            pull = existing
+            break
+    if pull is None:
+        pull = create_pull(repo, data.get("title") or "", data.get("body"), head, base)
+    return {"__t": "CreatePullRequestPayload",
+            "clientMutationId": data.get("clientMutationId"),
+            "pullRequest": gql_pull(repo, pull)}
+
+
+def gql_m_merge_pull(args: dict, ctx: dict) -> dict:
+    data = gql_input(args)
+    kind, number = gql_decode_id(data.get("pullRequestId"))
+    repo, pull = gql_find_pull(number) if kind == "PullRequest" else (None, None)
+    if pull is None:
+        raise GqlFail("Could not resolve to a PullRequest with the global id of '%s'."
+                      % data.get("pullRequestId"))
+    method = str(data.get("mergeMethod") or "MERGE").lower()
+    if method not in ("merge", "squash", "rebase"):
+        method = "squash"
+    if not pull.get("merged"):
+        merge_pull(repo, pull, method)
+    return {"__t": "MergePullRequestPayload",
+            "clientMutationId": data.get("clientMutationId"),
+            "pullRequest": gql_pull(repo, pull)}
+
+
+def gql_m_add_comment(args: dict, ctx: dict) -> dict:
+    data = gql_input(args)
+    kind, number = gql_decode_id(data.get("subjectId"))
+    repo, issue = gql_find_issue(number) if kind == "Issue" else (None, None)
+    if issue is None:
+        raise GqlFail("Could not resolve to a node with the global id of '%s'."
+                      % data.get("subjectId"))
+    body = data.get("body")
+    ts, iso = stamp()
+    comment = {"id": STORE.next_comment_id, "body": body if isinstance(body, str) else "",
+               "created_at": iso, "updated_at": iso, "_ts": ts}
+    STORE.next_comment_id += 1
+    issue["comments"].append(comment)
+    issue["updated_at"] = iso
+    STORE.touch(repo)
+    node = gql_comment(repo, issue, comment)
+    return {"__t": "AddCommentPayload",
+            "clientMutationId": data.get("clientMutationId"),
+            "commentEdge": {"__t": "IssueCommentEdge",
+                            "cursor": gql_cursor(len(issue["comments"])), "node": node},
+            "subject": gql_issue(repo, issue),
+            "timelineEdge": {"__t": "IssueCommentEdge", "cursor": gql_cursor(len(issue["comments"])),
+                             "node": node}}
+
+
+# -- execution -------------------------------------------------------------
+
+def gql_resolve_field(obj: dict, field: str, args: dict, ctx: dict):
+    t = obj.get("__t")
+    if field not in GQL_OBJECT_FIELDS.get(t, ()):
+        return _GQL_MISSING
+    if t == "Query":
+        if field == "viewer":
+            return gql_user(VIEWER)
+        if field in ("user", "repositoryOwner"):
+            login = args.get("login")
+            return gql_user(login) if isinstance(login, str) else None
+        if field == "repository":
+            return gql_repository_by_name(args.get("owner"), args.get("name"))
+        if field == "node":
+            return gql_node(args.get("id"))
+        if field == "__type":
+            return gql_type_object(args.get("name"))
+        if field == "__schema":
+            return gql_schema()
+        if field == "search":
+            return {"__t": "SearchResultItemConnection", "nodes": [], "edges": [],
+                    "totalCount": 0, "issueCount": 0, "repositoryCount": 0,
+                    "userCount": 0, "pageInfo": gql_page_info(False)}
+        if field == "rateLimit":
+            return {"__t": "RateLimit", "limit": 5000, "remaining": 4999, "used": 1,
+                    "resetAt": now_iso(), "cost": 1, "nodeCount": 0}
+        return None
+    if t == "Mutation":
+        if field == "createIssue":
+            return gql_m_create_issue(args, ctx)
+        if field == "closeIssue":
+            return gql_m_close_issue(args, ctx)
+        if field == "createPullRequest":
+            return gql_m_create_pull(args, ctx)
+        if field == "mergePullRequest":
+            return gql_m_merge_pull(args, ctx)
+        if field == "addComment":
+            return gql_m_add_comment(args, ctx)
+        return None
+    if t == "Repository":
+        repo = obj.get("__ref")
+        if repo is None:
+            return None
+        if field == "issue":
+            number = args.get("number")
+            issue = repo["issues_by_number"].get(number) if isinstance(number, int) else None
+            return gql_issue(repo, issue) if issue is not None else None
+        if field == "issues":
+            return gql_issues_connection(repo, args)
+        if field == "pullRequest":
+            number = args.get("number")
+            pull = repo["pulls"].get(number) if isinstance(number, int) else None
+            return gql_pull(repo, pull) if pull is not None else None
+        if field == "pullRequests":
+            return gql_pulls_connection(repo, args)
+        if field == "refs":
+            nodes = [{"__t": "Ref", "id": gql_global_id("Ref", repo["id"] * 100 + i + 1),
+                      "name": name, "prefix": "refs/heads/",
+                      "target": gql_commit(repo, ref["sha"])}
+                     for i, (name, ref) in enumerate(sorted(repo["refs"].items()))
+                     if isinstance(ref, dict)]
+            return {"__t": "RefConnection", "nodes": nodes, "edges": [],
+                    "totalCount": len(nodes), "pageInfo": gql_page_info(False)}
+        if field == "labels":
+            nodes = [gql_label(l) for l in repo["labels"].values()]
+            return {"__t": "LabelConnection", "nodes": nodes, "edges": [],
+                    "totalCount": len(nodes), "pageInfo": gql_page_info(False)}
+        if field in ("object", "ref"):
+            return None
+        if field == "repositoryTopics":
+            return {"__t": "RepositoryTopicConnection", "nodes": [], "edges": [],
+                    "totalCount": 0, "pageInfo": gql_page_info(False)}
+        return obj.get(field)
+    if t == "Issue":
+        repo, issue = obj.get("__ref") or (None, None)
+        if repo is None:
+            return None
+        if field == "repository":
+            return gql_repository(repo)
+        if field == "comments":
+            comments = [gql_comment(repo, issue, c) for c in issue["comments"]]
+            window, page_info = gql_window(comments, args)
+            return {"__t": "IssueCommentConnection", "nodes": window, "edges": [],
+                    "totalCount": len(comments), "pageInfo": page_info}
+        return obj.get(field)
+    if t == "PullRequest":
+        repo, pull = obj.get("__ref") or (None, None)
+        if repo is None:
+            return None
+        if field == "files":
+            return gql_files_connection(repo, pull, args)
+        if field in ("repository", "headRepository"):
+            return gql_repository(repo)
+        if field == "commits":
+            shas = [s for s in (pull.get("head_commits") or [])
+                    if s in repo["commits"]]
+            nodes = [gql_commit(repo, s) for s in shas]
+            return {"__t": "PullRequestCommitConnection", "nodes": nodes, "edges": [],
+                    "totalCount": len(nodes), "pageInfo": gql_page_info(False)}
+        return obj.get(field)
+    if t == "User":
+        if field == "repositories":
+            repos = [gql_repository(r) for r in STORE.repos.values()]
+            return {"__t": "RepositoryConnection", "nodes": repos, "edges": [],
+                    "totalCount": len(repos), "pageInfo": gql_page_info(False)}
+        return obj.get(field)
+    return obj.get(field)
+
+
+def gql_execute_selection(ctx: dict, value, selection, path: list):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [gql_execute_selection(ctx, item, selection, path) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for node in selection:
+        if node.get("kind") == "fragment":
+            condition = node.get("condition")
+            if condition is not None and condition != value.get("__t"):
+                continue
+            merged = gql_execute_selection(ctx, value, node["selection"], path)
+            if isinstance(merged, dict):
+                out.update(merged)
+            continue
+        alias = node["alias"]
+        field = node["name"]
+        if field == "__typename":
+            out[alias] = value.get("__t")
+            continue
+        args = dict((name, gql_value(raw, ctx["variables"]))
+                    for name, raw in (node.get("args") or {}).items())
+        result = gql_resolve_field(value, field, args, ctx)
+        if result is _GQL_MISSING:
+            ctx["errors"].append({
+                "message": "Field '%s' doesn't exist on type '%s'"
+                           % (field, value.get("__t")),
+                "path": list(path) + [alias]})
+            out[alias] = None
+            continue
+        if node.get("selection") is None:
+            out[alias] = result
+        else:
+            out[alias] = gql_execute_selection(ctx, result, node["selection"],
+                                               path + [alias])
+    return out
+
+
+def gql_run(payload) -> dict:
+    """One operation document -> the GraphQL {data, errors} envelope."""
+    if not isinstance(payload, dict):
+        return {"data": None, "errors": [
+            {"message": "Invalid request: expected a JSON object with a query"}]}
+    document = payload.get("query")
+    if not isinstance(document, str) or document.strip() == "":
+        return {"data": None, "errors": [
+            {"message": "Invalid request: the query document is missing"}]}
+    variables = payload.get("variables")
+    if not isinstance(variables, dict):
+        variables = {}
+    try:
+        operations = GqlParser(gql_tokenize(document)).parse_document()
+    except Exception as err:
+        return {"data": None, "errors": [{"message": "Syntax error: %s" % err}]}
+    if not operations:
+        return {"data": None, "errors": [{"message": "Syntax error: no operation"}]}
+    wanted = payload.get("operationName")
+    operation = None
+    for entry in operations:
+        if wanted is None or entry.get("name") == wanted:
+            operation = entry
+            break
+    if operation is None:
+        return {"data": None, "errors": [
+            {"message": "Unknown operation named '%s'" % (wanted,)}]}
+    ctx = {"variables": variables, "errors": []}
+    data = None
+    try:
+        root = {"__t": "Mutation" if operation["type"] == "mutation" else "Query"}
+        data = gql_execute_selection(ctx, root, operation["selection"], [])
+    except GqlFail as err:
+        ctx["errors"].append({"message": err.message})
+    except ApiError as err:
+        ctx["errors"].append({"message": err.message})
+    except Exception as err:
+        ctx["errors"].append({"message": "internal error: %s" % err})
+    out = {"data": data}
+    if ctx["errors"]:
+        out["errors"] = ctx["errors"]
+    return out
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 
@@ -1854,8 +2932,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_rest(method, path[len("/api/v3"):] or "/", query)
                 return
             if path.startswith("/api/graphql"):
-                self.send_json(200, {"data": None, "errors": [
-                    {"message": "GraphQL is not implemented in this milestone"}]})
+                self.handle_graphql(method)
                 return
             self.send_error_json(404, "Not Found")
         except ApiError as err:
@@ -1878,8 +2955,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.require_auth():
             return
         if method == "POST" and path.startswith("/graphql"):
-            self.send_json(200, {"data": None, "errors": [
-                {"message": "GraphQL is not implemented in this milestone"}]})
+            self.handle_graphql(method)
             return
         segments = [s for s in path.split("/") if s != ""]
         with store.lock:
@@ -2336,6 +3412,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, [store.commit_json(repo, pull["head_sha"])])
             return
         self.send_error_json(404, "Not Found")
+
+    # ---- GraphQL ---------------------------------------------------------
+    def handle_graphql(self, method: str):
+        if not self.require_auth():
+            return
+        if method != "POST":
+            self.send_json(405, {"message": "Method Not Allowed: POST a JSON document to /api/graphql"})
+            return
+        raw = self.read_body()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self.send_json(400, {"message": "Problems parsing JSON"})
+            return
+        with STORE.lock:
+            # One request may carry one document or an array of them (batching):
+            # the answer is one envelope, or an array of envelopes in the same order.
+            if isinstance(payload, list):
+                self.send_json(200, [gql_run(entry) for entry in payload])
+                return
+            self.send_json(200, gql_run(payload))
 
     # ---- MCP -------------------------------------------------------------
     def handle_mcp(self, method: str):
