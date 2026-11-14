@@ -1091,6 +1091,11 @@ def import_git_ref(repo: dict, ref: str, sha: str) -> None:
         if oid in seen:
             continue
         seen.add(oid)
+        if oid in repo["commits"]:
+            # Already transcribed, and its own ancestors came with it: stop the
+            # walk here. Otherwise every push re-walks the whole history (a push
+            # chain of n commits costs n*n/2 steps instead of n).
+            continue
         obj = gs.objects.get(oid)
         if obj is None:
             continue
@@ -2428,6 +2433,51 @@ class ResponseCache:
 
 RESPONSE_CACHE = ResponseCache(256)
 
+# The store is single-writer: a mutating request (or a read carrying a body)
+# invalidates every cached read. Bumping a generation counter does that in O(1)
+# and leaves the older entries to age out, so a repeated read after a write
+# (and the advertisement a push repeats every time) is still a cache hit for
+# the state it was produced from. Never part of the exported state.
+GENERATION = [0]
+
+
+def bump_generation() -> None:
+    GENERATION[0] += 1
+
+
+class GitResponseCache:
+    """Response bytes of an unchanged git request, keyed by its exact body.
+
+    A clone storm repeats the same ls-refs/fetch exchange fifty times, and the
+    pack for it is CPU work; the same bytes answer the same request as long as
+    the repository has not changed (a generation bump drops it). Bounded by
+    total bytes, evicting the oldest entry first. Never part of the export.
+    """
+
+    __slots__ = ("entries", "limit", "lock")
+
+    def __init__(self, limit: int = 4 << 20):
+        self.entries = {}
+        self.limit = limit
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            return self.entries.get(key)
+
+    def put(self, key, blob: bytes) -> None:
+        with self.lock:
+            if key in self.entries or len(blob) > (self.limit >> 2):
+                return
+            total = len(blob)
+            while self.entries and total > self.limit:
+                oldest = next(iter(self.entries))
+                total -= len(self.entries.pop(oldest))
+            self.entries[key] = blob
+
+
+GIT_RESPONSE_CACHE = GitResponseCache()
+
 
 def cacheable_status(blob: bytes) -> bool:
     """Only finished successes (and plain 404s) are worth replaying."""
@@ -2468,6 +2518,9 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "makefun-forge/1.0"
     sys_version = ""
+    # Buffer the response: a status line plus five header writes would otherwise
+    # be five send() syscalls per request, and the write workload is 200 of them.
+    wbufsize = 65536
     # Nagle plus the peer's delayed ACK costs ~45 ms on every keep-alive
     # round trip; the suite measures that latency, so turn it off.
     disable_nagle_algorithm = True
@@ -2661,14 +2714,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def git_upload_pack(self, repo):
         raw = self.read_body()
-        try:
-            if "version=2" in (self.headers.get("Git-Protocol") or ""):
-                body = self.git_v2(repo, raw)
-            else:
-                body = self.git_v0_fetch(repo, raw)
-        except ValueError as err:
-            self.send_error_json(400, "malformed git request: %s" % err)
-            return
+        # The same exchange repeats (fifty concurrent shallow clones ask byte for
+        # byte for the same pack): answer from the last identical request while
+        # the repository is unchanged.
+        ckey = (GENERATION[0], repo["id"], self.path, sha1_hex(raw))
+        body = GIT_RESPONSE_CACHE.get(ckey)
+        if body is None:
+            try:
+                if "version=2" in (self.headers.get("Git-Protocol") or ""):
+                    body = self.git_v2(repo, raw)
+                else:
+                    body = self.git_v0_fetch(repo, raw)
+            except ValueError as err:
+                self.send_error_json(400, "malformed git request: %s" % err)
+                return
+            GIT_RESPONSE_CACHE.put(ckey, body)
         self.send_git(200, "application/x-git-upload-pack-result", body)
 
     def git_v2(self, repo, raw):
@@ -2897,8 +2957,19 @@ class Handler(BaseHTTPRequestHandler):
         # body are answered by replaying the exact bytes we sent last time.
         verb = self.command
         key = None
+        if verb in ("GET", "HEAD") and not self.headers.get("Content-Length") \
+                and self.headers.get("Transfer-Encoding") is None:
+            # Nothing to drain, so the cache can answer before the URL is even
+            # parsed: this is the path the 2,000-read workload takes.
+            key = (GENERATION[0], verb, self.path, self.headers.get("Authorization") or "",
+                   self.headers.get("Git-Protocol") or "")
+            cached = RESPONSE_CACHE.get(key)
+            if cached is not None:
+                self._replay(cached)
+                return
+            key = None
         if verb in ("GET", "HEAD"):
-            key = (verb, self.path, self.headers.get("Authorization") or "",
+            key = (GENERATION[0], verb, self.path, self.headers.get("Authorization") or "",
                    self.headers.get("Git-Protocol") or "")
         capture = None
         try:
@@ -2912,7 +2983,7 @@ class Handler(BaseHTTPRequestHandler):
             if key is None:
                 # The store is single-writer: any mutation, and any read that
                 # carries a body, invalidates every response we are holding.
-                RESPONSE_CACHE.clear()
+                bump_generation()
             else:
                 cached = RESPONSE_CACHE.get(key)
                 if cached is not None:
