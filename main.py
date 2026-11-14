@@ -864,6 +864,53 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
     return bytes(out)
 
 
+def read_pack_simple(buf: bytes):
+    """(type, data) pairs of a pack that carries no delta objects, or None.
+
+    A push sends a handful of small whole objects, and the general decoder pays
+    for per-object dicts plus two side maps it only needs once a delta shows up.
+    The cheap pass answers that common case and returns None the moment a delta
+    appears, so the caller falls back to read_pack for the general one.
+    """
+    if len(buf) < 32 or buf[:4] != b"PACK":
+        raise ValueError("not a packfile")
+    if struct.unpack(">I", buf[4:8])[0] not in (2, 3):
+        raise ValueError("unsupported pack version")
+    count = struct.unpack(">I", buf[8:12])[0]
+    if count > 1000000:
+        raise ValueError("pack declares too many objects")
+    trailer = len(buf) - 20
+    off = 12
+    out = []
+    for _ in range(count):
+        byte = buf[off]
+        off += 1
+        code = (byte >> 4) & 7
+        size = byte & 15
+        shift = 4
+        while byte & 0x80:
+            byte = buf[off]
+            off += 1
+            size |= (byte & 0x7F) << shift
+            shift += 7
+        if code not in (1, 2, 3, 4):
+            return None
+        dec = zlib.decompressobj()
+        try:
+            data = dec.decompress(buf[off:trailer])
+        except zlib.error:
+            raise ValueError("bad pack zlib stream")
+        if not dec.eof:
+            raise ValueError("truncated pack object")
+        off = trailer - len(dec.unused_data)
+        if len(data) != size:
+            raise ValueError("pack object size mismatch")
+        out.append((_CODE_TYPE[code], data))
+    if off != trailer:
+        raise ValueError("pack has trailing bytes")
+    return out
+
+
 def read_pack(buf: bytes, base_lookup=None):
     """Decode a packfile (thin packs allowed) into a list of (type, data)."""
     if len(buf) < 32 or buf[:4] != b"PACK":
@@ -1146,8 +1193,11 @@ class GitStore:
         return oid
 
     def add_pack(self, buf: bytes) -> int:
+        objs = read_pack_simple(buf)
+        if objs is None:
+            objs = read_pack(buf, self.objects.get)
         added = 0
-        for otype, data in read_pack(buf, self.objects.get):
+        for otype, data in objs:
             self.put(otype, data)
             added += 1
         return added
@@ -3046,9 +3096,12 @@ class Handler(BaseHTTPRequestHandler):
                    self.headers.get("Git-Protocol") or "")
         capture = None
         try:
-            parsed = urlparse(self.path)
-            path = unquote(parsed.path)
-            query = parse_qs(parsed.query, keep_blank_values=True)
+            raw_path, _sep, raw_query = self.path.partition("?")
+            if raw_path.startswith(("http://", "https://")):
+                rest = raw_path.split("/", 3)
+                raw_path = "/" + (rest[3] if len(rest) > 3 else "")
+            path = unquote(raw_path) if "%" in raw_path else raw_path
+            query = parse_qs(raw_query, keep_blank_values=True) if raw_query else {}
             # Always consume the body first: a request whose body is left in the
             # socket desynchronizes the next request on the same keep-alive connection.
             if self.read_body():
