@@ -3107,7 +3107,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_repo(self, method: str, owner: str, name: str, rest: list, query: dict):
         store = STORE
-        if owner != VIEWER or (VIEWER, name) not in store.repos:
+        if owner != VIEWER:
+            self.send_error_json(404, "Not Found")
+            return
+        if (VIEWER, name) not in store.repos:
+            # Deleting a repository that is already gone is a no-op, not an error: a
+            # client that retries an idempotent DELETE must not watch the retry fail.
+            if method == "DELETE" and rest == []:
+                bump_generation()
+                self.send_json(204, None, raw=b"")
+                return
             self.send_error_json(404, "Not Found")
             return
         repo = store.repos[(VIEWER, name)]
